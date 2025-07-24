@@ -1,0 +1,266 @@
+/************************************
+ * CompOff Approval System Script
+ * Author: Custom Workflow for Manufacturing Company
+ ************************************/
+
+const SHEET_NAME = "Form Responses 1";
+const CORPORATE_HR_EMAILS = ["a@group.net.in", "b@group.net.in", "c@group.net.in", "dn@laxmigroup.net.in"];
+const PLANT_HR_EMAILS_BY_PLANT = {
+  "Corporate": ["a@group.net.in", "b@group.net.in", "c@group.net.in", "d@group.net.in"],
+  "NI - Unit II": ["a@group.net.in", "d@group.net.in"],
+  "NI - Unit III": ["a@group.net.in", "senthilvel.msm@group.net.in", "d@group.net.in"],
+  " Metal W - III": ["e@a@group.net.in", "e@group.net.in", "d@group.net.in"],
+  "NI - Unit IV": ["egroup.net.in"]
+};
+
+function onFormSubmit(e) {
+  if (!e || !e.range) return;
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const row = e.range.getRow();
+  const lastColumn = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const rowData = sheet.getRange(row, 1, 1, lastColumn).getValues()[0];
+  const formData = headers.reduce((acc, key, i) => (acc[key] = rowData[i], acc), {});
+
+  const requestNumbers = sheet.getRange(2, 2, sheet.getLastRow() - 1).getValues()
+    .flat().filter(val => !isNaN(val)).map(Number);
+  const nextRequestNumber = requestNumbers.length > 0 ? Math.max(...requestNumbers) + 1 : 1;
+  sheet.getRange(row, 2).setValue(nextRequestNumber.toString());
+
+  sendToHOD(formData, row, nextRequestNumber.toString());
+  notifyEmployeeSubmission(formData, nextRequestNumber.toString());
+}
+
+function formatDate(date) {
+  if (typeof date === "string") date = new Date(date);
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), "dd MMM yyyy HH:mm");
+}
+
+function formatDateOnly(date) {
+  if (!date) return "";
+  if (typeof date === "string") date = new Date(date);
+  if (Object.prototype.toString.call(date) !== "[object Date]" || isNaN(date)) return date;
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), "dd MMM yyyy");
+}
+
+function formatTimeOnly(time) {
+  if (typeof time === "string") time = new Date(time);
+  return Utilities.formatDate(time, Session.getScriptTimeZone(), "HH:mm");
+}
+
+function sendToHOD(data, row, requestNumber) {
+  const email = data["HOD Email"];
+  if (!email || !email.includes("@")) throw new Error("Invalid or missing HOD Email: " + email);
+
+  const html = generateEmailHTML(data, requestNumber, "HOD Approval Required", "#cce5ff");
+  const approvalUrl = getActionUrl("HOD", requestNumber, row, true);
+  const rejectUrl = getActionUrl("HOD", requestNumber, row, false);
+  const body = html + generateButtons(approvalUrl, rejectUrl) + "<br><br><strong>Regards,<br>NAHARS APPROVAL SYSTEM</strong>";
+
+  GmailApp.sendEmail(email, `CompOff Approval Request #${requestNumber} from ${data["Name"]}`, "", { htmlBody: body });
+}
+
+function getActionUrl(stage, requestNumber, row, isApproved) {
+  const action = isApproved ? "approve" : "reject";
+  return ScriptApp.getService().getUrl() + `?stage=${stage}&request=${requestNumber}&row=${row}&action=${action}`;
+}
+
+function doGet(e) {
+  const { stage, request, row, action } = e.parameter;
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const rowData = sheet.getRange(row, 1, 1, headers.length).getValues()[0];
+  const data = headers.reduce((acc, key, i) => (acc[key] = rowData[i], acc), {});
+  const statusColumnIndex = headers.indexOf(`${stage} Approval`) + 1;
+  const currentStatus = sheet.getRange(row, statusColumnIndex).getValue();
+
+  if (currentStatus === "Approved" || currentStatus === "Rejected") {
+    return HtmlService.createHtmlOutput(`<h3 style="color:orange;">You have already <strong>${currentStatus}</strong> this request.<br>No further action is allowed.</h3>`);
+  }
+
+  const status = action === "approve" ? "Approved" : "Rejected";
+  sheet.getRange(row, statusColumnIndex).setValue(status);
+
+  const plantSelection = (data["Plant Selection "] || data["Plant Selection  "] || "").toString().trim().toLowerCase();
+
+  if (stage === "HOD" && action === "approve") {
+    if (plantSelection === "corporate") {
+      sendToCorporateHR(data, row, request);
+      notifyEmployeeHold(data, request, "Corporate HR");
+    } else {
+      sendToPlantHR(data, row, request);
+      notifyEmployeeHold(data, request, "Plant HR");
+    }
+  } else if (stage === "Plant HR" && action === "approve") {
+    const approverEmail = Session.getActiveUser().getEmail();
+    sheet.getRange(row, 22).setValue(approverEmail); // Column V = 22
+
+    sendToCorporateHRNotification(data, request);
+    notifyEmployee(data, request, true, row);
+  } else if (stage === "Corporate HR" && action === "approve") {
+    const approverEmail = Session.getActiveUser().getEmail();
+    sheet.getRange(row, 21).setValue(approverEmail); // Column U = 21
+
+    notifyEmployee(data, request, true, row);
+  } else {
+    notifyEmployee(data, request, false, row);
+  }
+
+  return HtmlService.createHtmlOutput(`<h3 style="color:${action === "approve" ? 'green' : 'red'};">You have <strong>${status}</strong> request #${request}.<br>This decision is final and cannot be changed.</h3>`);
+}
+
+function sendToCorporateHR(data, row, requestNumber) {
+  const html = generateEmailHTML(data, requestNumber, "Corporate HR Approval Required (HOD Approved)", "#d4edda");
+  const approvalUrl = getActionUrl("Corporate HR", requestNumber, row, true);
+  const rejectUrl = getActionUrl("Corporate HR", requestNumber, row, false);
+
+  const approvalHistory = `<h4 style="margin-top:20px;color:#333;">Approval History</h4><p>✅ Approved by HOD: <strong>${data["HOD Email"]}</strong></p>`;
+  const body = html + generateButtons(approvalUrl, rejectUrl) + approvalHistory + "<br><br><strong>Regards,<br>NAHARS APPROVAL SYSTEM</strong>";
+
+  CORPORATE_HR_EMAILS.forEach(email => {
+    GmailApp.sendEmail(email, `CompOff Approval Request #${requestNumber} from ${data["Name"]}`, "", { htmlBody: body });
+  });
+}
+
+function sendToPlantHR(data, row, requestNumber) {
+  const plantSelection = (data["Plant Selection "] || "").trim();
+  const emails = PLANT_HR_EMAILS_BY_PLANT[plantSelection];
+
+  if (!emails || emails.length === 0) throw new Error("No Plant HR emails defined for selected plant: " + plantSelection);
+
+  const html = generateEmailHTML(data, requestNumber, "Plant HR Approval Required (HOD Approved)", "#d4edda");
+  const approvalUrl = getActionUrl("Plant HR", requestNumber, row, true);
+  const rejectUrl = getActionUrl("Plant HR", requestNumber, row, false);
+
+  const approvalHistory = `<h4 style="margin-top:20px;color:#333;">Approval History</h4><p>✅ Approved by HOD: <strong>${data["HOD Email"]}</strong></p>`;
+  const body = html + generateButtons(approvalUrl, rejectUrl) + approvalHistory + "<br><br><strong>Regards,<br>NAHARS APPROVAL SYSTEM</strong>";
+
+  emails.forEach(email => {
+    GmailApp.sendEmail(email, `CompOff Approval Request #${requestNumber} from ${data["Name"]}`, "", { htmlBody: body });
+  });
+}
+
+function sendToCorporateHRNotification(data, requestNumber) {
+  const html = generateEmailHTML(data, requestNumber, "Plant HR Approved - Final Confirmation", "#fff3cd") + "<br><br><strong>Regards,<br>NAHARS APPROVAL SYSTEM</strong>";
+  CORPORATE_HR_EMAILS.forEach(email => {
+    GmailApp.sendEmail(email, `CompOff Final Confirmation #${requestNumber} – ${data["Name"]}`, "", { htmlBody: html });
+  });
+}
+
+function notifyEmployee(data, requestNumber, isApproved, row) {
+  const status = isApproved ? "approved" : "rejected";
+  const color = isApproved ? "green" : "red";
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+
+  const hodApprover = data["HOD Email"] || "N/A";
+  const plantSelection = (data["Plant Selection "] || "").trim();
+
+  let hrApprover = "N/A";
+ 
+
+if (plantSelection === "Corporate") {
+  hrApprover = sheet.getRange(row, 21).getValue(); // ✅ Column U (Corporate HR Approver)
+} else {
+  hrApprover = sheet.getRange(row, 22).getValue(); // ✅ Column V (Plant HR Approver)
+}
+  const body = `
+    <div style="font-family:Arial; color:${color};">
+      <h3>Your CompOff Request #${requestNumber} has been <strong>${status.toUpperCase()}</strong></h3>
+      <p>✅ Approved by HOD: <strong>${hodApprover}</strong><br>
+      ✅ Approved by HR: <strong>${hrApprover}</strong></p>
+    </div>
+    <br><br><strong>Regards,<br>NAHARS APPROVAL SYSTEM</strong>
+  `;
+
+  GmailApp.sendEmail(data["Email address"], `CompOff Request #${requestNumber} ${status.toUpperCase()}`, "", {
+    htmlBody: body
+  });
+}
+
+
+
+function notifyEmployeeFinalApproval(data, row, requestNumber) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Form Responses 1");
+  const employeeEmail = data["Email Address"];
+  const hodApprover = data["HOD Email"];
+ 
+  // ✅ Get HR approver email based on Plant Selection
+  const plantSelection = (data["Plant Selection "] || "").trim();
+  let hrApprover = "";
+
+if (plantSelection === "Corporate") {
+  hrApprover = sheet.getRange(row, 21).getValue(); // ✅ Column U (Corporate HR Approver)
+} else {
+  hrApprover = sheet.getRange(row, 22).getValue(); // ✅ Column V (Plant HR Approver)
+}
+
+  const html = generateEmailHTML(data, requestNumber, "Your CompOff Request is Fully Approved ✅", "#d4edda");
+
+  // ✅ Include both HOD and HR approver details
+  const approvalDetails = `
+    <h4 style="margin-top:20px;color:#333;">Approval Summary</h4>
+    <p>✅ Approved by HOD: <strong>${hodApprover}</strong></p>
+    <p>✅ Final Approval by HR: <strong>${hrApprover}</strong></p>`;
+
+  const body = html + approvalDetails + "<br><br><strong>Regards,<br>NAHARS APPROVAL SYSTEM</strong>";
+
+  GmailApp.sendEmail(employeeEmail, `✅ CompOff Request #${requestNumber} Approved`, "", {
+    htmlBody: body,
+  });
+}
+
+
+
+
+function notifyEmployeeHold(data, requestNumber, nextStage) {
+  const html = `
+    <h2 style="color:#007bff;">STATUS UPDATE</h2>
+    <p>Dear ${data["Name"]},</p>
+    <p>Your CompOff request <strong>#${requestNumber}</strong> has been <strong>approved</strong> by HOD and is now <strong>under review by ${nextStage}</strong>.</p>
+    ${generateEmailHTML(data, requestNumber, `Request in Progress – At ${nextStage}`, "#cce5ff")}
+    <br><br><strong>Regards,<br>NAHARS APPROVAL SYSTEM</strong>
+  `;
+  GmailApp.sendEmail(data["Email address"], `Your CompOff Request #${requestNumber} is in progress`, "", { htmlBody: html });
+}
+
+function notifyEmployeeSubmission(data, requestNumber) {
+  const html = `
+    <h2 style="color:#28a745;">SUBMISSION SUCCESSFUL</h2>
+    <p>Dear ${data["Name"]},</p>
+    <p>Your CompOff request <strong>#${requestNumber}</strong> has been submitted successfully and is now <strong>waiting for HOD approval</strong>.</p>
+    ${generateEmailHTML(data, requestNumber, "Request Submitted", "#e2e3e5")}
+   <br><br><strong>Regards,<br>NAHARS APPROVAL SYSTEM</strong>
+  `;
+  GmailApp.sendEmail(data["Email address"], `Your CompOff Request #${requestNumber} has been submitted`, "", { htmlBody: html });
+}
+
+function generateButtons(approveUrl, rejectUrl) {
+  return `
+    <p>
+      <a href="${approveUrl}" style="padding:10px;background:green;color:white;text-decoration:none;margin-right:10px">Approve</a>
+      <a href="${rejectUrl}" style="padding:10px;background:red;color:white;text-decoration:none">Reject</a>
+    </p>`;
+}
+
+function generateEmailHTML(data, requestNumber, title, bgColor) {
+  return `
+    <div style="border:1px solid #ccc;padding:10px">
+     <h3 style="background:${bgColor};padding:10px">${title}</h3>
+      <table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse;width:100%">
+        <tr style="background:#007bff;color:white"><th>Field</th><th>Details</th></tr>
+        <tr><td>Request Number</td><td>${requestNumber}</td></tr>
+        <tr><td>Name</td><td>${data["Name"]}</td></tr>
+        <tr><td>Emp ID</td><td>${data["Emp ID"]}</td></tr>
+        <tr><td>Email</td><td>${data["Email address"]}</td></tr>
+        <tr><td>Department</td><td>${data["Dept."]}</td></tr>
+        <tr><td>Plant Selection</td><td>${data["Plant Selection "] || data["Plant Selection  "]}</td></tr>
+        <tr><td>Worked On</td><td>${formatDateOnly(data["Worked on (From Date)"])} (${formatTimeOnly(data["Start Time"])} to ${formatTimeOnly(data["End Time"])})</td></tr>
+        <tr><td>Till Date</td><td>${formatDateOnly(data["Till Date"])} (${formatTimeOnly(data["Start Time"])} to ${formatTimeOnly(data["End Time"])})</td></tr>
+
+        <tr><td>Reason</td><td>${data["Reason"]}</td></tr>
+        <tr><td>CompOff Required From</td><td>${formatDateOnly(data["Comp - Off Required (From Date)"])}</td></tr>
+        <tr><td>CompOff Required Till</td><td>${formatDateOnly(data["Comp - Off Required (Till Date)"])}</td></tr>
+      </table>
+    </div>`;
+}
